@@ -127,3 +127,84 @@ def get_deltas_from_bboxes(anchors, gt_boxes, pos_anchors):
         bbox_deltas[index] = [delta_x, delta_y, delta_w, delta_h]
     #
     return bbox_deltas
+def rpn_cls_loss(y_true, y_pred):
+    #二分类，框是否框到物体
+    indices = tf.where(tf.not_equal(y_true, -1))
+    target = tf.gather_nd(y_true, indices)
+    output = tf.gather_nd(y_pred, indices)
+    lf = tf.losses.BinaryCrossentropy()
+    return tf.reduce_mean(lf(target, output))
+
+def rpn_reg_loss(y_true, y_pred):
+    #对框住的框回归修正
+    indices = tf.where(tf.not_equal(y_true, 0))
+    target = tf.gather_nd(y_true, indices)
+    output = tf.gather_nd(y_pred, indices)
+    # Same with the smooth l1 loss
+    lf = tf.losses.Huber()
+    return tf.reduce_mean(lf(target, output))
+
+def get_image_params(img, stride):
+    '''
+        获得图片的长宽和输出的长宽
+    '''
+    height, width, _ = img.shape
+    output_height, output_width = height // stride, width // stride
+    return height, width, output_height, output_width
+
+def update_gt_boxes(gt_boxes, padding):
+    '''
+        因为要对原始图片填充后gt位置改变
+        函数对gt位置更新
+    '''
+    gt_boxes[:, 0] += padding["left"]
+    gt_boxes[:, 1] += padding["top"]
+    gt_boxes[:, 2] += padding["left"]
+    gt_boxes[:, 3] += padding["top"]
+    return gt_boxes
+
+def get_input_img(img, input_processor):
+    '''
+        调用tf预处理对图片处理
+    '''
+    processed_img = img.copy()
+    processed_img = input_processor(processed_img)
+    processed_img = np.expand_dims(processed_img, axis=0)
+    return processed_img
+
+def get_anchors(img, anchor_ratios, anchor_scales, stride):
+    '''
+        获得一张图片的anchor
+    '''
+    anchor_count = len(anchor_ratios) * len(anchor_scales)
+    height, width, output_height, output_width = get_image_params(img, stride)
+    #
+    grid_x = np.arange(0, output_width) * stride
+    grid_y = np.arange(0, output_height) * stride
+    #
+    #output_width and output_height是用整除算出来的，所以这里有一步相对位移的变化
+    width_padding = (width - output_width * stride) / 2
+    height_padding = (height - output_height * stride) / 2
+    grid_x = width_padding + grid_x
+    grid_y = height_padding + grid_y
+    #
+    grid_x, grid_y = np.meshgrid(grid_x, grid_y)
+    grid_map = np.vstack((grid_x.ravel(), grid_y.ravel(), grid_x.ravel(), grid_y.ravel())).transpose()
+    #
+    base_anchors = generate_base_anchors(stride, anchor_ratios, anchor_scales)
+    #
+    output_area = grid_map.shape[0]
+    anchors = base_anchors.reshape((1, anchor_count, 4)) + \
+              grid_map.reshape((1, output_area, 4)).transpose((1, 0, 2))
+    anchors = anchors.reshape((output_area * anchor_count, 4)).astype(np.float32)
+    return anchors
+
+def non_max_suppression(pred_bboxes, pred_labels, top_n_boxes=300):
+    '''
+        使用极大抑制方法得到300个候选框
+    '''
+    # This method get bboxes [y1, x1, y2, x2] format but it could be used
+    selected_indices = tf.image.non_max_suppression(pred_bboxes, pred_labels, top_n_boxes)
+    selected_boxes = tf.gather(pred_bboxes, selected_indices)
+    selected_labels = tf.gather(pred_labels, selected_indices)
+    return selected_boxes.numpy(), selected_labels.numpy()
