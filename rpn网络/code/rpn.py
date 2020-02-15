@@ -208,3 +208,81 @@ def non_max_suppression(pred_bboxes, pred_labels, top_n_boxes=300):
     selected_boxes = tf.gather(pred_bboxes, selected_indices)
     selected_labels = tf.gather(pred_labels, selected_indices)
     return selected_boxes.numpy(), selected_labels.numpy()
+def get_predicted_bboxes_and_labels(anchor_count, anchors, pred_bbox_deltas, pred_labels):
+    '''
+        1. 模型得到预测的deltas和label
+        2. 然后根据anchors得到预处的框
+    '''
+    _, output_height, output_width, _ = pred_bbox_deltas.shape
+    n_row = output_height * output_width * anchor_count
+    pred_bbox_deltas = pred_bbox_deltas.reshape((n_row, 4))
+    pred_labels = pred_labels.reshape((n_row, ))
+    pred_bboxes = get_bboxes_from_deltas(anchors, pred_bbox_deltas)
+    return pred_bboxes, pred_labels
+
+
+def get_bbox_deltas_and_labels(img, anchors, gt_boxes, anchor_count, stride, img_boundaries):
+    '''
+        1. 获得iou排序取前64个
+        2. 构造pos_anchor[index,class_index]
+        3. 构造neg_anchor[index]
+        4. iou前64个作为正例，iou小于0.3作为反例
+        5. pos_label = 1, neg_label = 0
+        6. pos_label, neg_label 不相等随机选取(len(neg_label) - len(neg_label))为-1
+
+        7. deltas 是一个四维的数据，center_x, center_y, width, height 是一个相对于gt的值
+    '''
+    height, width, output_height, output_width = get_image_params(img, stride)
+    #
+    iou_map = generate_iou_map(anchors, gt_boxes, img_boundaries)
+    # any time => iou_map.reshape(output_height, output_width, anchor_count, gt_boxes.shape[0])
+    ################################################################
+    max_indices_each_gt_box = iou_map.argmax(axis=1)
+    # IoU map has iou values for every gt boxes and we merge these values column wise
+    merged_iou_map = iou_map[np.arange(iou_map.shape[0]), max_indices_each_gt_box]
+    sorted_iou_map = merged_iou_map.argsort()[::-1]
+    total_gt_box_count = gt_boxes.shape[0]
+    # Positive and negative anchor numbers are 128 in original paper
+    total_pos_anchor_number = 64
+    # We initialize pos anchors with max n anchors
+    pos_anchors = np.array((sorted_iou_map[:total_pos_anchor_number], max_indices_each_gt_box[sorted_iou_map[:total_pos_anchor_number]]), dtype=np.int32).transpose()
+    # This operation could cause duplicate pos anchors
+    # But this is not so important because we handle it during delta calculations
+    for n_col in range(total_gt_box_count):
+        replace_index = total_pos_anchor_number - n_col - 1
+        anchor_indices_for_gt_box = np.where(max_indices_each_gt_box == n_col)[0]
+        sorted_anchor_indices_for_gt_box = iou_map[anchor_indices_for_gt_box, n_col].argsort()[::-1]
+        sorted_max_anchor_indices_for_gt_box = anchor_indices_for_gt_box[sorted_anchor_indices_for_gt_box]
+        if not sorted_max_anchor_indices_for_gt_box.shape[0] > 0:
+            continue
+        max_anchor_index_for_gt_box = sorted_max_anchor_indices_for_gt_box[0]
+        pos_anchors[replace_index] = [max_anchor_index_for_gt_box, n_col]
+    #
+    neg_anchors = np.where(merged_iou_map < 0.3)[0]
+    neg_anchors = neg_anchors[~np.isin(neg_anchors, pos_anchors[:,0])]
+    #############################
+    # Bbox delta calculation
+    #############################
+    bbox_deltas = get_deltas_from_bboxes(anchors, gt_boxes, pos_anchors)
+    #############################
+    # Label calculation
+    #############################
+    # labels => 1 object, 0 background, -1 neutral
+    labels = -1 * np.ones((iou_map.shape[0], ), dtype=np.float32)
+    labels[neg_anchors] = 0
+    labels[pos_anchors[:,0]] = 1
+    neg_anchors_count = len(neg_anchors)
+    pos_anchors_count = len(pos_anchors[:,0])
+    # We want to same number of positive and negative anchors
+    # If there are more negative anchors than positive
+    # Randomly change negative anchors to the neutral
+    # until negative and positive anchors are equal
+    if neg_anchors_count > pos_anchors_count:
+        new_neutral_anchors = np.random.choice(neg_anchors, size=(neg_anchors_count - pos_anchors_count), replace=False)
+        labels[new_neutral_anchors] = -1
+    ############################################################
+    bbox_deltas = bbox_deltas.reshape(output_height, output_width, anchor_count * 4)
+    bbox_deltas = np.expand_dims(bbox_deltas, axis=0)
+    labels = labels.reshape(output_height, output_width, anchor_count)
+    labels = np.expand_dims(labels, axis=0)
+    return bbox_deltas, labels
