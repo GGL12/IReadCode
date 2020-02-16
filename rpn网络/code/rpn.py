@@ -286,3 +286,46 @@ def get_bbox_deltas_and_labels(img, anchors, gt_boxes, anchor_count, stride, img
     labels = labels.reshape(output_height, output_width, anchor_count)
     labels = np.expand_dims(labels, axis=0)
     return bbox_deltas, labels
+
+def generator(data,
+              anchor_ratios,
+              anchor_scales,
+              stride,
+              input_processor,
+              max_height=None,
+              max_width=None,
+              apply_padding=False):
+    while True:
+        for image_data in data:
+            img = image_data["image"].numpy()
+            #获取grund true
+            gt_boxes = Helpers.bbox_handler(img, image_data["objects"]["bbox"])
+            #获取边际
+            img_boundaries = Helpers.get_image_boundaries(img)
+            if apply_padding:
+                #500*500 标准化, 填充的边框值
+                img, padding = Helpers.get_padded_img(img, max_height, max_width)
+                #更新填充后的grund true
+                gt_boxes = update_gt_boxes(gt_boxes, padding)
+                #更新填充后的边际
+                img_boundaries = Helpers.update_image_boundaries_with_padding(img_boundaries, padding)
+            anchors = get_anchors(img, anchor_ratios, anchor_scales, stride)
+            anchor_count = len(anchor_ratios) * len(anchor_scales)
+            #产生的框与gt的相对比例 [center_x, center_y, width, height]
+            bbox_deltas, labels = get_bbox_deltas_and_labels(img, anchors, gt_boxes, anchor_count, stride, img_boundaries)
+            #图片预处理
+            input_img = get_input_img(img, input_processor)
+            yield input_img, [bbox_deltas, labels]
+
+
+def get_model(base_model, anchor_count):
+    '''
+        vgg16基本模型
+            class model
+            regression model
+    '''
+    output = Conv2D(512, (3, 3), activation="relu", padding="same", name="rpn_conv")(base_model.output)
+    rpn_cls_output = Conv2D(anchor_count, (1, 1), activation="sigmoid", name="rpn_cls")(output)
+    rpn_reg_output = Conv2D(anchor_count * 4, (1, 1), activation="linear", name="rpn_reg")(output)
+    rpn_model = Model(inputs=base_model.input, outputs=[rpn_reg_output, rpn_cls_output])
+    return rpn_model
